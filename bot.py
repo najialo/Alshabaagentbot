@@ -57,6 +57,18 @@ if not OPENAI_API_KEY:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL غير موجود")
 
+# SQLAlchemy async requires the asyncpg driver prefix.
+# Supabase / Railway usually give you a plain postgresql:// URL,
+# so we normalize it here automatically.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://", "postgresql+asyncpg://", 1
+    )
+
 
 # =========================
 # LOGGING
@@ -350,33 +362,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["adding_property"] = True
+    context.user_data["searching"] = False
+    context.user_data["pending_images"] = []
 
     await update.message.reply_text(
-        "📥 أرسل الآن نص العقار أو صور العقار."
+        "📥 أرسل الآن نص العقار أو صور العقار (يمكنك إرسال عدة صور، ثم اكتب انتهيت)."
     )
 
 
 # =========================
-# HANDLE TEXT
+# PROCESS EXTRACTED DATA (shared by text & photo flow)
 # =========================
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = update.message.text
-
-    if not context.user_data.get("adding_property"):
-
-        await update.message.reply_text(
-            "أرسل /add أولاً لإضافة عقار، أو /search للبحث."
-        )
-
-        return
+async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, text, image_urls=None):
 
     await update.message.reply_text(
         "🧠 جارٍ تحليل بيانات العقار..."
     )
 
-    data = await extract_property(text)
+    data = await extract_property(text, image_urls=image_urls)
 
     context.user_data["pending_property"] = data
 
@@ -415,6 +419,65 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         message,
         reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# =========================
+# HANDLE PHOTOS
+# =========================
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not context.user_data.get("adding_property"):
+
+        await update.message.reply_text(
+            "أرسل /add أولاً لإضافة عقار."
+        )
+
+        return
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+
+    pending_images = context.user_data.setdefault("pending_images", [])
+    pending_images.append(file.file_path)
+
+    caption = update.message.caption
+
+    if caption:
+        # Caption present: treat this as the final message, run extraction now
+        await process_extraction(update, context, caption, image_urls=pending_images)
+        context.user_data["pending_images"] = []
+    else:
+        await update.message.reply_text(
+            f"📷 تم استلام الصورة ({len(pending_images)}). "
+            "أرسل المزيد من الصور، أو اكتب النص/التفاصيل الآن لبدء التحليل."
+        )
+
+
+# =========================
+# HANDLE TEXT (routes between add / search / idle)
+# =========================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    text = update.message.text
+
+    if context.user_data.get("searching"):
+        await search_text(update, context)
+        return
+
+    if context.user_data.get("adding_property"):
+
+        pending_images = context.user_data.get("pending_images") or []
+
+        await process_extraction(update, context, text, image_urls=pending_images or None)
+
+        context.user_data["pending_images"] = []
+        return
+
+    await update.message.reply_text(
+        "أرسل /add أولاً لإضافة عقار، أو /search للبحث."
     )
 
 
@@ -480,6 +543,7 @@ async def confirm_property(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("pending_property", None)
     context.user_data["adding_property"] = False
+    context.user_data["pending_images"] = []
 
     await query.edit_message_text(
         f"""
@@ -506,6 +570,7 @@ async def cancel_property(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("pending_property", None)
     context.user_data["adding_property"] = False
+    context.user_data["pending_images"] = []
 
     await query.edit_message_text(
         "❌ تم إلغاء إضافة العقار."
@@ -519,6 +584,7 @@ async def cancel_property(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["searching"] = True
+    context.user_data["adding_property"] = False
 
     await update.message.reply_text(
         """
@@ -571,9 +637,6 @@ max_area
 
 
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not context.user_data.get("searching"):
-        return
 
     query_text = update.message.text
 
@@ -772,6 +835,13 @@ def main():
         CallbackQueryHandler(
             cancel_property,
             pattern="^cancel_property$",
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            handle_photo,
         )
     )
 
