@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -16,21 +17,6 @@ from telegram.ext import (
     filters,
 )
 
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Float,
-    Text,
-    DateTime,
-    select,
-)
-from sqlalchemy.ext.asyncio import (
-    create_async_engine,
-    async_sessionmaker,
-)
-from sqlalchemy.orm import declarative_base
-
 
 # =========================
 # CONFIG
@@ -40,7 +26,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+DATA_FILE = os.getenv("DATA_FILE", "properties.json")
 
 ADMIN_IDS = {
     int(x.strip())
@@ -53,21 +40,6 @@ if not BOT_TOKEN:
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY غير موجود")
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL غير موجود")
-
-# SQLAlchemy async requires the asyncpg driver prefix.
-# Supabase / Railway usually give you a plain postgresql:// URL,
-# so we normalize it here automatically.
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgresql://", "postgresql+asyncpg://", 1
-    )
-elif DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://", "postgresql+asyncpg://", 1
-    )
 
 
 # =========================
@@ -83,75 +55,70 @@ logger = logging.getLogger("alshahba")
 
 
 # =========================
-# DATABASE
+# JSON STORAGE
 # =========================
 
-Base = declarative_base()
-
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
-
-SessionLocal = async_sessionmaker(
-    engine,
-    expire_on_commit=False,
-)
+_storage_lock = asyncio.Lock()
 
 
-class Property(Base):
-    __tablename__ = "properties"
+def _load_properties_sync():
+    if not os.path.exists(DATA_FILE):
+        return []
 
-    id = Column(Integer, primary_key=True)
-
-    property_code = Column(String(30), unique=True, nullable=False)
-
-    status = Column(String(30), default="available")
-    operation = Column(String(30))
-
-    property_type = Column(String(100))
-
-    city = Column(String(100))
-    district = Column(String(150))
-    neighborhood = Column(String(150))
-    address = Column(Text)
-
-    area_m2 = Column(Float)
-    rooms = Column(Integer)
-    bathrooms = Column(Integer)
-
-    floor = Column(String(50))
-    total_floors = Column(Integer)
-
-    building_age = Column(Integer)
-
-    furnished = Column(String(30))
-
-    price = Column(Float)
-    currency = Column(String(10))
-
-    description = Column(Text)
-
-    owner_name = Column(String(200))
-    owner_phone = Column(String(100))
-
-    source = Column(String(100))
-    source_url = Column(Text)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return []
+            return json.loads(content)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Failed to read %s: %s", DATA_FILE, e)
+        return []
 
 
-async def init_db():
+def _save_properties_sync(properties):
+    tmp_path = DATA_FILE + ".tmp"
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(properties, f, ensure_ascii=False, indent=2)
 
-    logger.info("Database initialized")
+    os.replace(tmp_path, DATA_FILE)
+
+
+async def load_properties():
+    async with _storage_lock:
+        return _load_properties_sync()
+
+
+async def save_properties(properties):
+    async with _storage_lock:
+        _save_properties_sync(properties)
+
+
+async def add_property(record):
+    async with _storage_lock:
+        properties = _load_properties_sync()
+
+        next_id = (max((p.get("id", 0) for p in properties), default=0)) + 1
+        record["id"] = next_id
+        record["property_code"] = f"SH-{next_id:04d}"
+
+        now = datetime.now(timezone.utc).isoformat()
+        record["created_at"] = now
+        record["updated_at"] = now
+
+        properties.append(record)
+
+        _save_properties_sync(properties)
+
+        return record
+
+
+async def init_storage():
+    if not os.path.exists(DATA_FILE):
+        _save_properties_sync([])
+
+    logger.info("JSON storage ready at %s", DATA_FILE)
 
 
 # =========================
@@ -272,27 +239,6 @@ async def extract_property(text, image_urls=None):
             "conflicts": ["تعذر تحليل البيانات"],
             "missing_fields": [],
         }
-
-
-# =========================
-# CODE GENERATOR
-# =========================
-
-async def generate_property_code(session):
-
-    result = await session.execute(
-        select(Property.id)
-        .order_by(Property.id.desc())
-        .limit(1)
-    )
-
-    last_id = result.scalar()
-
-    number = (last_id or 0) + 1
-
-    return f"SH-{number:04d}"
-
-
 # =========================
 # FORMAT PROPERTY
 # =========================
@@ -377,7 +323,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, text, image_urls=None):
 
     await update.message.reply_text(
-        "🧠 جارٍ تحليل بيانات العقار..."
+        "🧠 جار تحليل بيانات العقار..."
     )
 
     data = await extract_property(text, image_urls=image_urls)
@@ -445,7 +391,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption
 
     if caption:
-        # Caption present: treat this as the final message, run extraction now
         await process_extraction(update, context, caption, image_urls=pending_images)
         context.user_data["pending_images"] = []
     else:
@@ -479,8 +424,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أرسل /add أولاً لإضافة عقار، أو /search للبحث."
     )
-
-
 # =========================
 # CONFIRM
 # =========================
@@ -509,37 +452,31 @@ async def confirm_property(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    async with SessionLocal() as session:
+    record = {
+        "status": "available",
+        "operation": data.get("operation"),
+        "property_type": data.get("property_type"),
+        "city": data.get("city"),
+        "district": data.get("district"),
+        "neighborhood": data.get("neighborhood"),
+        "address": data.get("address"),
+        "area_m2": data.get("area_m2"),
+        "rooms": data.get("rooms"),
+        "bathrooms": data.get("bathrooms"),
+        "floor": data.get("floor"),
+        "total_floors": data.get("total_floors"),
+        "building_age": data.get("building_age"),
+        "furnished": data.get("furnished"),
+        "price": data.get("price"),
+        "currency": data.get("currency"),
+        "description": data.get("description"),
+        "owner_name": data.get("owner_name"),
+        "owner_phone": data.get("owner_phone"),
+        "source": "telegram",
+        "source_url": None,
+    }
 
-        code = await generate_property_code(session)
-
-        property_obj = Property(
-            property_code=code,
-            status="available",
-            operation=data.get("operation"),
-            property_type=data.get("property_type"),
-            city=data.get("city"),
-            district=data.get("district"),
-            neighborhood=data.get("neighborhood"),
-            address=data.get("address"),
-            area_m2=data.get("area_m2"),
-            rooms=data.get("rooms"),
-            bathrooms=data.get("bathrooms"),
-            floor=data.get("floor"),
-            total_floors=data.get("total_floors"),
-            building_age=data.get("building_age"),
-            furnished=data.get("furnished"),
-            price=data.get("price"),
-            currency=data.get("currency"),
-            description=data.get("description"),
-            owner_name=data.get("owner_name"),
-            owner_phone=data.get("owner_phone"),
-            source="telegram",
-        )
-
-        session.add(property_obj)
-
-        await session.commit()
+    saved = await add_property(record)
 
     context.user_data.pop("pending_property", None)
     context.user_data["adding_property"] = False
@@ -550,7 +487,7 @@ async def confirm_property(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ تم حفظ العقار بنجاح.
 
 🆔 رقم العقار:
-{code}
+{saved["property_code"]}
 
 وضع العقار:
 🟢 متاح
@@ -636,61 +573,58 @@ max_area
         return {}
 
 
+def _matches(p, criteria):
+
+    if criteria.get("property_type"):
+        if not p.get("property_type") or criteria["property_type"].lower() not in p["property_type"].lower():
+            return False
+
+    if criteria.get("city"):
+        if not p.get("city") or criteria["city"].lower() not in p["city"].lower():
+            return False
+
+    if criteria.get("district"):
+        if not p.get("district") or criteria["district"].lower() not in p["district"].lower():
+            return False
+
+    if criteria.get("rooms") is not None:
+        if p.get("rooms") != criteria["rooms"]:
+            return False
+
+    if criteria.get("min_price") is not None:
+        if p.get("price") is None or p["price"] < criteria["min_price"]:
+            return False
+
+    if criteria.get("max_price") is not None:
+        if p.get("price") is None or p["price"] > criteria["max_price"]:
+            return False
+
+    if criteria.get("min_area") is not None:
+        if p.get("area_m2") is None or p["area_m2"] < criteria["min_area"]:
+            return False
+
+    if criteria.get("max_area") is not None:
+        if p.get("area_m2") is None or p["area_m2"] > criteria["max_area"]:
+            return False
+
+    return True
+
+
 async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query_text = update.message.text
 
     criteria = await perform_search(query_text)
 
-    async with SessionLocal() as session:
+    properties = await load_properties()
 
-        stmt = select(Property).where(
-            Property.status == "available"
-        )
+    available = [p for p in properties if p.get("status") == "available"]
 
-        if criteria.get("property_type"):
-            stmt = stmt.where(
-                Property.property_type.ilike(
-                    f"%{criteria['property_type']}%"
-                )
-            )
-
-        if criteria.get("city"):
-            stmt = stmt.where(
-                Property.city.ilike(
-                    f"%{criteria['city']}%"
-                )
-            )
-
-        if criteria.get("district"):
-            stmt = stmt.where(
-                Property.district.ilike(
-                    f"%{criteria['district']}%"
-                )
-            )
-
-        if criteria.get("rooms"):
-            stmt = stmt.where(
-                Property.rooms == criteria["rooms"]
-            )
-
-        if criteria.get("min_price") is not None:
-            stmt = stmt.where(
-                Property.price >= criteria["min_price"]
-            )
-
-        if criteria.get("max_price") is not None:
-            stmt = stmt.where(
-                Property.price <= criteria["max_price"]
-            )
-
-        result = await session.execute(stmt)
-
-        properties = result.scalars().all()
+    matched = [p for p in available if _matches(p, criteria)]
 
     context.user_data["searching"] = False
 
-    if not properties:
+    if not matched:
 
         await update.message.reply_text(
             "❌ لم أجد عقارات مطابقة لطلبك."
@@ -698,42 +632,35 @@ async def search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    text = f"🔎 وجدت {len(properties)} عقار:\n\n"
+    text = f"🔎 وجدت {len(matched)} عقار:\n\n"
 
-    for p in properties[:20]:
+    for p in matched[:20]:
 
         text += f"""
-🆔 {p.property_code}
-🏠 {p.property_type or "-"}
-📍 {p.city or "-"} - {p.district or "-"}
-📐 {p.area_m2 or "-"} م²
-🛏️ {p.rooms or "-"} غرف
-💰 {p.price or "-"} {p.currency or ""}
+🆔 {p.get("property_code", "-")}
+🏠 {p.get("property_type") or "-"}
+📍 {p.get("city") or "-"} - {p.get("district") or "-"}
+📐 {p.get("area_m2") or "-"} م²
+🛏️ {p.get("rooms") or "-"} غرف
+💰 {p.get("price") or "-"} {p.get("currency") or ""}
 
 ----------------
 """
-
-    await update.message.reply_text(text)
-
-
 # =========================
 # LIST
 # =========================
 
 async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    async with SessionLocal() as session:
+    properties = await load_properties()
 
-        result = await session.execute(
-            select(Property)
-            .where(Property.status == "available")
-            .order_by(Property.id.desc())
-            .limit(20)
-        )
+    available = [p for p in properties if p.get("status") == "available"]
 
-        properties = result.scalars().all()
+    available.sort(key=lambda p: p.get("id", 0), reverse=True)
 
-    if not properties:
+    latest = available[:20]
+
+    if not latest:
 
         await update.message.reply_text(
             "لا توجد عقارات مسجلة."
@@ -743,13 +670,13 @@ async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "🏠 آخر العقارات:\n\n"
 
-    for p in properties:
+    for p in latest:
 
         text += f"""
-🆔 {p.property_code}
-📍 {p.city or "-"} - {p.district or "-"}
-🏠 {p.property_type or "-"}
-💰 {p.price or "-"} {p.currency or ""}
+🆔 {p.get("property_code", "-")}
+📍 {p.get("city") or "-"} - {p.get("district") or "-"}
+🏠 {p.get("property_type") or "-"}
+💰 {p.get("price") or "-"} {p.get("currency") or ""}
 """
 
     await update.message.reply_text(text)
@@ -761,22 +688,16 @@ async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    async with SessionLocal() as session:
-
-        result = await session.execute(
-            select(Property)
-        )
-
-        properties = result.scalars().all()
+    properties = await load_properties()
 
     total = len(properties)
 
     available = len(
-        [p for p in properties if p.status == "available"]
+        [p for p in properties if p.get("status") == "available"]
     )
 
     sold = len(
-        [p for p in properties if p.status == "sold"]
+        [p for p in properties if p.get("status") == "sold"]
     )
 
     await update.message.reply_text(
@@ -854,7 +775,7 @@ def main():
 
     async def startup(app):
 
-        await init_db()
+        await init_storage()
 
     application.post_init = startup
 
@@ -865,3 +786,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    await update.message.reply_text(text)
