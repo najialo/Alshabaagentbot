@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import traceback
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -26,6 +27,13 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Model used for extraction / search parsing.
+# NOTE: "gpt-5" was in the original code — if this model name is wrong or not
+# available on your account, every extraction call will fail. Set this via
+# env var so you can fix it without touching code, and confirm the exact
+# model string from your OpenAI dashboard.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 
 DATA_FILE = os.getenv("DATA_FILE", "properties.json")
 
@@ -181,6 +189,31 @@ EXTRACTION_PROMPT = """
 """
 
 
+def _empty_extraction(error_note=None):
+    return {
+        "operation": None,
+        "property_type": None,
+        "city": None,
+        "district": None,
+        "neighborhood": None,
+        "address": None,
+        "area_m2": None,
+        "rooms": None,
+        "bathrooms": None,
+        "floor": None,
+        "total_floors": None,
+        "building_age": None,
+        "furnished": None,
+        "price": None,
+        "currency": None,
+        "description": None,
+        "owner_name": None,
+        "owner_phone": None,
+        "conflicts": [error_note] if error_note else [],
+        "missing_fields": [],
+    }
+
+
 async def extract_property(text, image_urls=None):
 
     content = [
@@ -199,46 +232,33 @@ async def extract_property(text, image_urls=None):
                 }
             )
 
-    response = await client.responses.create(
-        model="gpt-5",
-        input=[
-            {
-                "role": "user",
-                "content": content,
-            }
-        ],
-    )
+    # --- THE FIX ---
+    # The API call itself was not wrapped in try/except. Any failure here
+    # (bad model name, expired/invalid key, no quota, network timeout, rate
+    # limit) raised an uncaught exception. Since there is also no global
+    # error handler registered on the Application, the bot would silently
+    # die on that update — the user just sees "جارٍ تحليل..." forever.
+    try:
+        response = await client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        )
+    except Exception as e:
+        logger.error("OpenAI extraction call failed: %s", e, exc_info=True)
+        return _empty_extraction(f"فشل الاتصال بخدمة التحليل: {e}")
 
     raw = response.output_text
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-
         logger.error("AI returned invalid JSON: %s", raw)
-
-        return {
-            "operation": None,
-            "property_type": None,
-            "city": None,
-            "district": None,
-            "neighborhood": None,
-            "address": None,
-            "area_m2": None,
-            "rooms": None,
-            "bathrooms": None,
-            "floor": None,
-            "total_floors": None,
-            "building_age": None,
-            "furnished": None,
-            "price": None,
-            "currency": None,
-            "description": None,
-            "owner_name": None,
-            "owner_phone": None,
-            "conflicts": ["تعذر تحليل البيانات"],
-            "missing_fields": [],
-        }
+        return _empty_extraction("تعذر تحليل البيانات")
 
 
 # =========================
@@ -564,16 +584,20 @@ max_area
 أخرج JSON فقط.
 """
 
-    response = await client.responses.create(
-        model="gpt-5",
-        input=prompt,
-    )
+    # --- THE FIX ---
+    # Same missing try/except issue existed here around the API call.
+    try:
+        response = await client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+    except Exception as e:
+        logger.error("OpenAI search-parsing call failed: %s", e, exc_info=True)
+        return {}
 
     try:
         return json.loads(response.output_text)
-
     except Exception:
-
         return {}
 
 
@@ -722,6 +746,37 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
+# GLOBAL ERROR HANDLER (NEW)
+# =========================
+# python-telegram-bot does NOT reply to the user automatically when a
+# handler raises. Without this, any unexpected exception (network glitch,
+# bug, etc.) makes the bot go silent on that update, exactly like what you
+# saw. This logs the full traceback and — if possible — tells the user
+# something went wrong instead of leaving them hanging.
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+
+    logger.error(
+        "Unhandled exception while processing update: %s",
+        context.error,
+        exc_info=context.error,
+    )
+
+    tb_string = "".join(
+        traceback.format_exception(None, context.error, context.error.__traceback__)
+    )
+    logger.error(tb_string)
+
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ صار خطأ غير متوقع أثناء المعالجة. جرّب مرة ثانية، وإذا تكررت المشكلة راجع اللوجات."
+            )
+        except Exception:
+            pass
+
+
+# =========================
 # MAIN
 # =========================
 
@@ -780,6 +835,10 @@ def main():
             handle_text,
         )
     )
+
+    # Register the global error handler so failures are logged AND the
+    # user gets some feedback instead of silence.
+    application.add_error_handler(error_handler)
 
     async def startup(app):
 
