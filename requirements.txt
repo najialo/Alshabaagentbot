@@ -1,5 +1,5 @@
 python-telegram-bot==22.3
-openai>=1.99.0
+google-generativeai>=0.8.0
 SQLAlchemy>=2.0.41
 asyncpg>=0.30.0
 psycopg2-binary>=2.9.10
