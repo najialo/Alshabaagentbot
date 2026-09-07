@@ -28,10 +28,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Free-tier Gemini model. "gemini-2.0-flash" has a generous free daily quota
-# and supports both text and image input, which is exactly what this bot
-# needs. You can override via env var without touching code.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# ✅ النموذج المحدث - gemini-2.5-flash
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 DATA_FILE = os.getenv("DATA_FILE", "properties.json")
 
@@ -818,7 +816,7 @@ def main():
 
     application.post_init = startup
 
-    logger.info("Alshahba AI started (Gemini)")
+    logger.info("Alshahba AI started (Gemini 2.5 Flash)")
 
     application.run_polling()
 
