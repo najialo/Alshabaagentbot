@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+import google.generativeai as genai
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,14 +26,12 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Model used for extraction / search parsing.
-# NOTE: "gpt-5" was in the original code — if this model name is wrong or not
-# available on your account, every extraction call will fail. Set this via
-# env var so you can fix it without touching code, and confirm the exact
-# model string from your OpenAI dashboard.
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+# Free-tier Gemini model. "gemini-2.0-flash" has a generous free daily quota
+# and supports both text and image input, which is exactly what this bot
+# needs. You can override via env var without touching code.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 DATA_FILE = os.getenv("DATA_FILE", "properties.json")
 
@@ -46,8 +44,10 @@ ADMIN_IDS = {
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN غير موجود")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY غير موجود")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY غير موجود")
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 
 # =========================
@@ -130,11 +130,16 @@ async def init_storage():
 
 
 # =========================
-# OPENAI
+# GEMINI MODEL
 # =========================
 
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY
+_generation_config = genai.types.GenerationConfig(
+    response_mime_type="application/json",
+)
+
+_model = genai.GenerativeModel(
+    model_name=GEMINI_MODEL,
+    generation_config=_generation_config,
 )
 
 
@@ -155,9 +160,7 @@ EXTRACTION_PROMPT = """
 إذا كان هناك تعارض بين النص والصورة:
 ضع التعارض داخل conflicts.
 
-أخرج JSON فقط.
-
-المفاتيح المطلوبة:
+أخرج JSON فقط بالمفاتيح التالية بالضبط:
 
 {
   "operation": null,
@@ -214,45 +217,24 @@ def _empty_extraction(error_note=None):
     }
 
 
-async def extract_property(text, image_urls=None):
+async def extract_property(text, images=None):
+    """
+    images: optional list of dicts {"mime_type": "image/jpeg", "data": bytes}
+    """
 
-    content = [
-        {
-            "type": "input_text",
-            "text": EXTRACTION_PROMPT + "\n\nالنص:\n" + (text or "")
-        }
-    ]
+    parts = [EXTRACTION_PROMPT + "\n\nالنص:\n" + (text or "")]
 
-    if image_urls:
-        for url in image_urls:
-            content.append(
-                {
-                    "type": "input_image",
-                    "image_url": url,
-                }
-            )
+    if images:
+        for img in images:
+            parts.append(img)
 
-    # --- THE FIX ---
-    # The API call itself was not wrapped in try/except. Any failure here
-    # (bad model name, expired/invalid key, no quota, network timeout, rate
-    # limit) raised an uncaught exception. Since there is also no global
-    # error handler registered on the Application, the bot would silently
-    # die on that update — the user just sees "جارٍ تحليل..." forever.
     try:
-        response = await client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
-        )
+        response = await _model.generate_content_async(parts)
     except Exception as e:
-        logger.error("OpenAI extraction call failed: %s", e, exc_info=True)
+        logger.error("Gemini extraction call failed: %s", e, exc_info=True)
         return _empty_extraction(f"فشل الاتصال بخدمة التحليل: {e}")
 
-    raw = response.output_text
+    raw = response.text
 
     try:
         return json.loads(raw)
@@ -342,13 +324,13 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PROCESS EXTRACTED DATA (shared by text & photo flow)
 # =========================
 
-async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, text, image_urls=None):
+async def process_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE, text, images=None):
 
     await update.message.reply_text(
         "🧠 جارٍ تحليل بيانات العقار..."
     )
 
-    data = await extract_property(text, image_urls=image_urls)
+    data = await extract_property(text, images=images)
 
     context.user_data["pending_property"] = data
 
@@ -407,13 +389,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
 
+    image_bytes = bytes(await file.download_as_bytearray())
+
     pending_images = context.user_data.setdefault("pending_images", [])
-    pending_images.append(file.file_path)
+    pending_images.append({"mime_type": "image/jpeg", "data": image_bytes})
 
     caption = update.message.caption
 
     if caption:
-        await process_extraction(update, context, caption, image_urls=pending_images)
+        await process_extraction(update, context, caption, images=pending_images)
         context.user_data["pending_images"] = []
     else:
         await update.message.reply_text(
@@ -438,7 +422,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending_images = context.user_data.get("pending_images") or []
 
-        await process_extraction(update, context, text, image_urls=pending_images or None)
+        await process_extraction(update, context, text, images=pending_images or None)
 
         context.user_data["pending_images"] = []
         return
@@ -584,19 +568,14 @@ max_area
 أخرج JSON فقط.
 """
 
-    # --- THE FIX ---
-    # Same missing try/except issue existed here around the API call.
     try:
-        response = await client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-        )
+        response = await _model.generate_content_async(prompt)
     except Exception as e:
-        logger.error("OpenAI search-parsing call failed: %s", e, exc_info=True)
+        logger.error("Gemini search-parsing call failed: %s", e, exc_info=True)
         return {}
 
     try:
-        return json.loads(response.output_text)
+        return json.loads(response.text)
     except Exception:
         return {}
 
@@ -746,13 +725,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# GLOBAL ERROR HANDLER (NEW)
+# GLOBAL ERROR HANDLER
 # =========================
-# python-telegram-bot does NOT reply to the user automatically when a
-# handler raises. Without this, any unexpected exception (network glitch,
-# bug, etc.) makes the bot go silent on that update, exactly like what you
-# saw. This logs the full traceback and — if possible — tells the user
-# something went wrong instead of leaving them hanging.
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
@@ -836,8 +810,6 @@ def main():
         )
     )
 
-    # Register the global error handler so failures are logged AND the
-    # user gets some feedback instead of silence.
     application.add_error_handler(error_handler)
 
     async def startup(app):
@@ -846,7 +818,7 @@ def main():
 
     application.post_init = startup
 
-    logger.info("Alshahba AI started")
+    logger.info("Alshahba AI started (Gemini)")
 
     application.run_polling()
 
