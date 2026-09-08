@@ -28,8 +28,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ✅ النموذج المجاني الشغال حالياً (Flash-tier، ضمن الحصة المجانية فعلياً)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# ✅ الموديل الصحيح والحالي (Flash-tier، بدون فوترة إلزامية)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 DATA_FILE = os.getenv("DATA_FILE", "properties.json")
 
